@@ -1,5 +1,7 @@
 # dsh-rtk-optimizer
 
+[![npm version](https://img.shields.io/npm/v/dsh-rtk-optimizer.svg)](https://www.npmjs.com/package/dsh-rtk-optimizer)
+
 RTK 命令改写建议 + 工具输出压缩——DSH 插件（Host 拦截器），移植自 Pi Coding Agent 生态的 [pi-rtk-optimizer](https://github.com/MasuRii/pi-rtk-optimizer)。
 
 不注册模型工具：它挂在两个工具事件上，全局生效（对所有会话的 `bash`/`grep`/`read` 调用），并提供 `/rtk` 命令查看状态。
