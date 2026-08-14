@@ -33,12 +33,23 @@ RTK 命令改写建议 + 工具输出压缩——DSH 插件（Host 拦截器）�
 
 ### 3. `/rtk` 命令
 
-`/rtk [show|verify|stats|clear-stats|reset|help]`——配置与运行状态、rtk 二进制探测、压缩节省量统计。
+`/rtk [show|verify|stats|clear-stats|reset|set|help]`——配置与运行状态、rtk 二进制探测、压缩节省量统计。
+
+| 子命令 | 说明 |
+|---|---|
+| `show` | 当前配置 + rtk 二进制状态 + 统计 |
+| `verify` | 检查 rtk 二进制是否可用（探测结果缓存 60s） |
+| `stats` / `clear-stats` | 查看 / 重置压缩节省量统计 |
+| `set <key> <value>` | 运行时切换：`mode`（suggest\|rewrite）、`enabled`、`guardWhenRtkMissing`、`readCompaction` |
+| `reset` | 恢复默认配置 |
+
+> 实现适配：rtk 0.43 对成功改写返回**退出码 3**（非文档所述 0），插件同时接受 0 与 3；不支持的命令退出 1 且无输出，命令原样放行。
 
 ## 安装
 
 - **动态插件**：`cordis_define`（`code.host` = `src/host.js` 逐字）→ `cordis_run`。
 - **静态挂载**：`index.js` 以普通 Node 模块加载同一函数体（本插件不注册模型工具，无 harness 适配需求）；部署位置 `~/.dsh/profiles/web/plugins/dsh-rtk-optimizer/` + `cordis.patch.yml` 加 `insert` 行。
+- 插件声明 `inject: ['subprocess', 'commands', 'timer']`，静态加载时等这些服务就绪后才 apply（include 条目并行加载，无 inject 会竞态降级）。
 
 ## 开发
 
