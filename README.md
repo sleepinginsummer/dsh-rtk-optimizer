@@ -49,10 +49,11 @@ RTK 命令改写建议 + 工具输出压缩——DSH 插件（Host 拦截器）�
 
 ## 安装
 
-- **npm bundle（官方标准分发）**：发布到 npm 后 `dsh plugin --profile <name> add dsh-rtk-optimizer`（包声明 `dsh.bundle`，安装时自动加入 bundle 层）。
-- **动态插件**：`cordis_define`（`code.host` = `src/host.js` 逐字）→ `cordis_run`。
-- **静态挂载**：`index.js` 以普通 Node 模块加载同一函数体（本插件不注册模型工具，无 harness 适配需求）；部署位置 `~/.dsh/profiles/web/plugins/dsh-rtk-optimizer/` + `cordis.patch.yml` 加 `insert` 行。
-- 插件声明 `inject: ['subprocess', 'commands', 'timer']`，静态加载时等这些服务就绪后才 apply（include 条目并行加载，无 inject 会竞态降级）。
+```bash
+dsh plugin --profile <name> add dsh-rtk-optimizer
+```
+
+安装后重启 DSH，压缩与改写对全部会话的 `bash`/`grep`/`read` 调用生效（`/rtk` 命令可查状态与统计）。
 
 ## 开发
 
