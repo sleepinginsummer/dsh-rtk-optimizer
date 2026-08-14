@@ -323,7 +323,7 @@ return {
         state.rtkCheckedAt = now()
         return exe
       } catch (e) {
-        console.error(`dsh-rtk-optimizer: resolveExecutable(rtk) failed: ${errText(e)}`)
+        if (config.debug) console.error(`dsh-rtk-optimizer: resolveExecutable(rtk) failed: ${errText(e)}`)
         state.rtkResolved = null
         state.rtkCheckedAt = now()
         return undefined
@@ -354,16 +354,16 @@ return {
         // rtk 0.43 exits 3 (not 0) on successful rewrites; 1 means "no
         // equivalent" with no stdout. Accept 0 and 3.
         if (!outcome || (outcome.exitCode !== 0 && outcome.exitCode !== 3)) {
-          console.error(`dsh-rtk-optimizer: rtk rewrite exit=${outcome ? outcome.exitCode : 'timeout'}`)
+          if (config.debug) console.error(`dsh-rtk-optimizer: rtk rewrite exit=${outcome ? outcome.exitCode : 'timeout'}`)
           return undefined
         }
         const reader = handle.collected && handle.collected.stdout
         const text = reader ? (await reader.readFrom(0)).text : ''
         const rewritten = text.trim()
-        console.error(`dsh-rtk-optimizer: rtk rewrite of "${command}" → "${rewritten}"`)
+        if (config.debug) console.error(`dsh-rtk-optimizer: rtk rewrite of "${command}" → "${rewritten}"`)
         return rewritten.length > 0 && rewritten !== command ? rewritten : undefined
       } catch (e) {
-        console.error(`dsh-rtk-optimizer: rtk rewrite threw: ${errText(e)}`)
+        if (config.debug) console.error(`dsh-rtk-optimizer: rtk rewrite threw: ${errText(e)}`)
         return undefined
       }
     }
