@@ -50,8 +50,16 @@ RTK 命令改写建议 + 工具输出压缩——DSH 插件（Host 拦截器）�
 | `show` | 当前配置 + rtk 二进制状态 + 统计 |
 | `verify` | 检查 rtk 二进制是否可用（探测结果缓存 60s） |
 | `stats` / `clear-stats` | 查看 / 重置压缩节省量统计 |
-| `set <key> <value>` | 运行时切换：`mode`（suggest\|rewrite\|hook）、`enabled`、`guardWhenRtkMissing`、`readCompaction`、`debug` |
-| `reset` | 恢复默认配置 |
+| `set <key> <value>` | 运行时切换：`mode`（suggest\|rewrite\|hook）、`enabled`、`guardWhenRtkMissing`、`readCompaction`、`debug`（**自动持久化**，见下） |
+| `reset` | 恢复默认配置（同步写回持久化） |
+
+### 配置持久化
+
+`/rtk set` 与 `/rtk reset` 会把改动**自动写回 profile 的 `cordis.patch.yml`**（id-targeted
+override 块，默认路径 `~/.dsh/profiles/web/cordis.patch.yml`；可通过注入配置
+`persistFile` 覆盖，如 `config: { persistFile: "/path/to/cordis.patch.yml" }`），
+重启 DSH 后保持生效。持久化键：`mode`、`enabled`、`guardWhenRtkMissing`、
+`readCompaction`、`debug`。patch 文件不可写时降级为内存修改并提示 `(not persisted)`。
 
 > 实现适配：rtk 0.43 对成功改写返回**退出码 3**（非文档所述 0），插件同时接受 0 与 3；不支持的命令退出 1 且无输出，命令原样放行。
 

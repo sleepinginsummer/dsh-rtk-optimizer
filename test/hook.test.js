@@ -64,12 +64,13 @@ function mount(opts = {}) {
       }
       if (name === 'timer') return { timeout: () => Promise.resolve() }
       if (name === 'commands') return { register: (def) => { handlers.command = def.handler } }
+      if (name === 'fs' && opts.fs) return opts.fs
       return undefined
     },
     on: (event, fn) => { handlers[event] = fn },
     provide: () => () => {}
   }
-  plugin.apply(ctx)
+  plugin.apply(ctx, opts.injected)
   assert.ok(handlers.command, 'rtk command must be registered')
   return {
     handlers,
@@ -121,7 +122,7 @@ test('/rtk set mode hook succeeds', async () => {
   const t = mount()
   const out = await t.runCommand('set mode hook')
   assert.equal(out.kind, 'success')
-  assert.match(out.text, /mode set to hook/)
+  assert.match(out.text, /mode=hook/)
 })
 
 test('/rtk help lists hook mode', async () => {
@@ -417,4 +418,67 @@ test('hook mode execute propagates spillPath from the rewritten stdout/stderr st
   assert.equal(out.value.stdout.text, 'big output\n')
   assert.equal(out.value.stdout.spillPath, '/tmp/spilled-stdout.log', 'stdout spillPath must propagate')
   assert.equal(out.value.stderr.spillPath, '/tmp/spilled-stderr.log', 'stderr spillPath must propagate')
+})
+
+// ── Config persistence (cordis.patch.yml) ────────────────────────────────────
+
+/** In-memory fake of ctx.fs backed by a single string "file". */
+function makeFakeFs(initial = '') {
+  let content = initial
+  return {
+    content: () => content,
+    resolve: async (path) => ({ displayPath: path, targetKey: `fake:${path}` }),
+    readText: async () => { if (content === '__MISSING__') throw new Error('ENOENT'); return content },
+    writeText: async (target, text) => { content = text; return { version: 1 } }
+  }
+}
+
+test('injected config merges over DEFAULT_CONFIG (persisted mode applies at apply time)', async () => {
+  const t = mount({ injected: { mode: 'hook' } })
+  const out = await t.runCommand('show')
+  assert.equal(out.kind, 'success')
+  assert.match(out.text, /mode: hook/, 'injected mode applies at apply time')
+  // DEFAULT values still hold for keys not injected
+  assert.match(out.text, /enabled: true/)
+})
+
+test('/rtk set persists mode into the patch file via ctx.fs (key added to existing block)', async () => {
+  const fs = makeFakeFs('- id: dsh-rtk-optimizer\n  name: dsh-rtk-optimizer\n- id: token-panel\n  name: dsh-token-panel\n')
+  const t = mount({ fs, injected: { persistFile: '/tmp/fake-patch.yml' } })
+  const out = await t.runCommand('set mode hook')
+  assert.equal(out.kind, 'success')
+  assert.ok(!out.text.includes('not persisted'), 'set must persist when fs is available')
+  const text = fs.content()
+  assert.ok(text.includes('- id: dsh-rtk-optimizer'), 'block kept')
+  assert.match(text, /config:\n\s+mode: "hook"/, 'mode added under config:')
+  assert.ok(text.includes('- id: token-panel'), 'other entries untouched')
+})
+
+test('/rtk set updates an existing persisted key in place (no duplicate)', async () => {
+  const fs = makeFakeFs('- id: dsh-rtk-optimizer\n  config:\n    mode: "suggest"\n- id: token-panel\n')
+  const t = mount({ fs, injected: { persistFile: '/tmp/fake-patch.yml' } })
+  await t.runCommand('set mode hook')
+  const text = fs.content()
+  const matches = text.match(/mode: "hook"/g) ?? []
+  assert.equal(matches.length, 1, 'exactly one mode key, updated in place')
+  assert.ok(!/mode: "suggest"/.test(text), 'old value replaced')
+})
+
+test('/rtk set appends a new id-targeted block when the patch has no entry yet', async () => {
+  const fs = makeFakeFs('- id: token-panel\n  name: dsh-token-panel\n')
+  const t = mount({ fs, injected: { persistFile: '/tmp/fake-patch.yml' } })
+  await t.runCommand('set debug true')
+  const text = fs.content()
+  assert.ok(text.includes('- id: dsh-rtk-optimizer'), 'block appended')
+  assert.match(text, /debug: true/, 'key present')
+  assert.ok(text.includes('- id: token-panel'), 'existing entry kept')
+})
+
+test('persist failure degrades to in-memory-only (success response with not persisted)', async () => {
+  const fs = makeFakeFs()
+  fs.writeText = async () => { throw new Error('write denied') }
+  const t = mount({ fs, injected: { persistFile: '/tmp/fake-patch.yml' } })
+  const out = await t.runCommand('set mode hook')
+  assert.equal(out.kind, 'success')
+  assert.ok(out.text.includes('(not persisted)'), 'command still succeeds, warns not persisted')
 })

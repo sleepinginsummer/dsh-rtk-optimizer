@@ -296,11 +296,24 @@ return {
   // (static mount: bundle rows load in parallel; without this, apply() could
   // run before subprocess/commands/timer are mounted and silently degrade).
   inject: ['subprocess', 'commands', 'timer'],
-  apply(ctx) {
+  apply(ctx, injected) {
     const subprocess = ctx.get('subprocess')
     const commands = ctx.get('commands')
     const timer = ctx.get('timer')
-    const config = { ...DEFAULT_CONFIG }
+    const fs = ctx.get('fs')
+    const config = {
+      ...DEFAULT_CONFIG,
+      ...(injected && typeof injected === 'object' ? injected : {})
+    }
+    // Persisted settings file. `config.persistFile` wins; else DSH_HOME
+    // profile patch (web) or a plain home fallback.
+    const homeDir = typeof process !== 'undefined' && process.env ? process.env.HOME : undefined
+    const dshHome = typeof process !== 'undefined' && process.env ? process.env.DSH_HOME : undefined
+    const persistFile = typeof config.persistFile === 'string' && config.persistFile.length > 0
+      ? config.persistFile
+      : (dshHome
+        ? `${dshHome}/profiles/web/cordis.patch.yml`
+        : (homeDir ? `${homeDir}/.dsh/profiles/web/cordis.patch.yml` : ''))
 
     // ── Runtime state ──
     const state = {
@@ -323,6 +336,95 @@ return {
     }
     function now() {
       return Date.now()
+    }
+
+    // ── Config persistence (cordis.patch.yml id-targeted override) ──
+    // The keys a user can change at runtime; everything else stays in memory.
+    const PERSIST_KEYS = ['mode', 'enabled', 'guardWhenRtkMissing', 'readCompaction', 'debug']
+
+    /** Render one `key: value` YAML line, quoting strings like `mode: hook`. */
+    function yamlValue(value) {
+      if (typeof value === 'string') return `"${value}"`
+      return String(value)
+    }
+
+    /**
+     * Update (or create) the `- id: dsh-rtk-optimizer` block's `config:` map in
+     * a cordis.patch.yml text, setting exactly `changes` (key → value) and
+     * leaving every other line untouched. Returns the new file text.
+     */
+    function applyPatchUpdate(text, changes) {
+      const lines = text.split('\n')
+      const idIdx = lines.findIndex((l) => l.trim() === '- id: dsh-rtk-optimizer')
+      if (idIdx === -1) {
+        // No block yet: append an id-targeted override at the end.
+        const block = ['- id: dsh-rtk-optimizer', '  config:']
+        for (const [k, v] of Object.entries(changes)) block.push(`    ${k}: ${yamlValue(v)}`)
+        return text.replace(/\s*$/, '\n') + block.join('\n') + '\n'
+      }
+      // Locate this block's config: map. The block spans until the next line
+      // that starts (after optional indent) with `- id:` or a bare `-`.
+      let cfgIdx = -1
+      let cfgIndent = ''
+      for (let i = idIdx + 1; i < lines.length; i++) {
+        const t = lines[i].trim()
+        if (t.startsWith('- id:') || t === '-') break
+        const m = lines[i].match(/^(\s*)config:/)
+        if (m) { cfgIdx = i; cfgIndent = m[1]; break }
+      }
+      const result = lines.slice()
+      const setKey = (key, value) => {
+        if (cfgIdx !== -1) {
+          // Does this key already exist inside the config map? (lines more
+          // indented than `config:` and not a new list item)
+          const innerIndent = cfgIndent + '  '
+          for (let i = cfgIdx + 1; i < result.length; i++) {
+            const line = result[i]
+            if (line.trim() === '' || line.trim().startsWith('#')) continue
+            if (!line.startsWith(innerIndent)) break
+            const km = line.match(/^(\s*)([A-Za-z0-9_]+):/)
+            if (km && km[2] === key) {
+              result[i] = `${innerIndent}${key}: ${yamlValue(value)}`
+              return
+            }
+          }
+          // key absent: insert right after config: (before its first child)
+          result.splice(cfgIdx + 1, 0, `${innerIndent}${key}: ${yamlValue(value)}`)
+        } else {
+          // No config: map in this block — add one after the id line.
+          const insertAt = idIdx + 1
+          result.splice(insertAt, 0, `  config:`, `    ${key}: ${yamlValue(value)}`)
+          cfgIdx = insertAt
+          cfgIndent = '  '
+        }
+      }
+      for (const [k, v] of Object.entries(changes)) setKey(k, v)
+      return result.join('\n')
+    }
+
+    /**
+     * Persist `changes` into the profile patch file via ctx.fs. No-ops with a
+     * debug log when fs is unavailable or the file cannot be written.
+     */
+    async function persistConfig(changes) {
+      if (fs === undefined || !persistFile) return false
+      try {
+        const target = await fs.resolve(persistFile)
+        let current = ''
+        try {
+          current = await fs.readText(target)
+        } catch (e) {
+          // file may not exist yet — start from an empty patch
+          if (config.debug) console.error(`dsh-rtk-optimizer: persist read failed (starting empty): ${errText(e)}`)
+        }
+        const next = applyPatchUpdate(current, changes)
+        await fs.writeText(target, next, undefined, undefined, undefined)
+        if (config.debug) console.error(`dsh-rtk-optimizer: persisted ${Object.keys(changes).join(',')} → ${persistFile}`)
+        return true
+      } catch (e) {
+        if (config.debug) console.error(`dsh-rtk-optimizer: persist failed: ${errText(e)}`)
+        return false
+      }
     }
 
     // ── rtk binary access ──
@@ -636,27 +738,28 @@ return {
               case 'set': {
                 const key = rest[0]
                 const value = rest[1]
+                const changes = {}
                 if (key === 'mode' && (value === 'suggest' || value === 'rewrite' || value === 'hook')) {
                   c.mode = value
-                  return { kind: 'success', text: `rtk-optimizer mode set to ${value}.` }
-                }
-                if (key === 'enabled' && (value === 'true' || value === 'false')) {
+                  changes.mode = value
+                } else if (key === 'enabled' && (value === 'true' || value === 'false')) {
                   c.enabled = value === 'true'
-                  return { kind: 'success', text: `rtk-optimizer enabled=${c.enabled}.` }
-                }
-                if (key === 'guardWhenRtkMissing' && (value === 'true' || value === 'false')) {
+                  changes.enabled = value === 'true'
+                } else if (key === 'guardWhenRtkMissing' && (value === 'true' || value === 'false')) {
                   c.guardWhenRtkMissing = value === 'true'
-                  return { kind: 'success', text: `rtk-optimizer guardWhenRtkMissing=${c.guardWhenRtkMissing}.` }
-                }
-                if (key === 'readCompaction' && (value === 'true' || value === 'false')) {
+                  changes.guardWhenRtkMissing = value === 'true'
+                } else if (key === 'readCompaction' && (value === 'true' || value === 'false')) {
                   c.outputCompaction.readCompaction = value === 'true'
-                  return { kind: 'success', text: `rtk-optimizer readCompaction=${c.outputCompaction.readCompaction}.` }
-                }
-                if (key === 'debug' && (value === 'true' || value === 'false')) {
+                  changes.readCompaction = value === 'true'
+                } else if (key === 'debug' && (value === 'true' || value === 'false')) {
                   c.debug = value === 'true'
-                  return { kind: 'success', text: `rtk-optimizer debug=${c.debug}.` }
+                  changes.debug = value === 'true'
+                } else {
+                  return { kind: 'error', text: 'usage: /rtk set <key> <value> — keys: mode (suggest|rewrite|hook), enabled (true|false), guardWhenRtkMissing (true|false), readCompaction (true|false), debug (true|false)' }
                 }
-                return { kind: 'error', text: 'usage: /rtk set <key> <value> — keys: mode (suggest|rewrite|hook), enabled (true|false), guardWhenRtkMissing (true|false), readCompaction (true|false), debug (true|false)' }
+                const persisted = await persistConfig(changes)
+                const suffix = persisted ? '' : ' (not persisted)'
+                return { kind: 'success', text: `rtk-optimizer ${key}=${value}.${suffix}` }
               }
               case 'show': {
                 // Probe (fresh) so the status is truthful even before the first
@@ -706,7 +809,10 @@ return {
               }
               case 'reset': {
                 Object.assign(config, JSON.parse(JSON.stringify(DEFAULT_CONFIG)))
-                return { kind: 'success', text: 'rtk-optimizer config reset to defaults.' }
+                const changes = {}
+                for (const k of PERSIST_KEYS) changes[k] = config[k]
+                const persisted = await persistConfig(changes)
+                return { kind: 'success', text: `rtk-optimizer config reset to defaults.${persisted ? '' : ' (not persisted)'}` }
               }
               case 'help':
               case '': {
