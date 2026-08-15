@@ -577,6 +577,18 @@ return {
         }
       }
 
+      // hook mode: prefix a note that the command was replaced by its rtk form
+      const hookExecuted = state.hookExecuted.get(exec.callId)
+      state.hookExecuted.delete(exec.callId)
+      if (hookExecuted !== undefined && !result.isError) {
+        const note = `[rtk-optimizer] hook: executed as "${hookExecuted}"`
+        const blocks = result.content
+        const existing = blocks.some((b) => b && b.type === 'text' && typeof b.text === 'string' && b.text.includes('[rtk-optimizer]'))
+        if (!existing) {
+          compactedBlocks = [{ type: 'text', text: note }, ...(compactedBlocks ?? blocks)]
+        }
+      }
+
       if (compactedBlocks === undefined) return next()
 
       state.stats.calls += 1
