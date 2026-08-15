@@ -86,8 +86,8 @@ dsh-rtk-optimizer 是运行在 DSH（DeepSeek Harness）上的插件，在模型
 ### 3. 关键约束与兜底
 
 - `exec.arguments` 不可改写 → 替换必须走 `tools/execute` 短路（已确认可行）。
-- rtk 缺失 / hook 调用失败 / 超时 → 清除 plan，`next()` 放行原命令。
-- 无改写（rtk 认为无需优化）→ 放行原命令。
+- **spawn 异常 / rtk 缺失 / 无改写** → 清除 plan，`next()` 放行原命令（此时原命令尚未执行，放行安全）。
+- **执行超时** → 返回超时结果 `{ kind: 'foreground', timedOut: true, ... }`（rtk 包装器可能已执行一半，放行会重复执行原命令，故不放行）。
 - **安全考量**：短路会绕过 DSH 的 bash sandbox（原命令由 rtk 包装器执行）。
   设计上：hook 模式默认在 `enabled` 且 rtk 可用时生效；README 显著标注此风险，
   建议仅在可信环境下开启 hook 模式。
