@@ -23,6 +23,19 @@ function mount(opts = {}) {
   const fakeSpawn = (spec) => {
     spawnLog.push({ spec })
     const r = typeof opts.spawnResult === 'function' ? opts.spawnResult(spec) : opts.spawnResult
+    // A thenable `r` means the caller scripts a spawn whose `done` never
+    // settles (task-3 timeout test) so the timer branch of the execute race
+    // wins; model it directly instead of wrapping a default outcome.
+    if (r && typeof r.then === 'function') {
+      return {
+        done: r,
+        terminate: () => {},
+        collected: {
+          stdout: { readFrom: async () => ({ text: '', nextOffset: 0, lossy: false }) },
+          stderr: { readFrom: async () => ({ text: '', nextOffset: 0, lossy: false }) }
+        }
+      }
+    }
     const outcome = r?.outcome ?? { exitCode: 0, signal: null }
     const stdoutText = r?.stdout ?? ''
     const stderrText = r?.stderr ?? ''
@@ -163,4 +176,75 @@ test('hook mode pre-execute allows when rtk binary is missing', async () => {
   const { out, nextCalled } = await pre(t, 'call-3', 'ls')
   assert.equal(nextCalled, true)
   assert.equal(spawnLog.length, 0, 'no hook spawn when rtk missing')
+})
+
+// ── Task 3: tools/execute short-circuit ─────────────────────────────────────
+
+test('hook mode execute short-circuits with a foreground value running the rewritten command', async () => {
+  const spawnLog = []
+  const t = mount({
+    spawnLog,
+    spawnResult: (spec) => {
+      if (spec.argv[1] === 'hook') {
+        return { outcome: { exitCode: 0, signal: null }, stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls -la' } } }) }
+      }
+      // the rewritten command execution
+      return { outcome: { exitCode: 0, signal: null }, stdout: 'file1\nfile2\n', stderr: '' }
+    }
+  })
+  await t.runCommand('set mode hook')
+  await pre(t, 'call-exec-1', 'ls -la')
+  const { out, nextCalled } = await exec(t, 'call-exec-1', 'ls -la')
+  assert.equal(nextCalled, false, 'execute must short-circuit, not fall through to real bash')
+  assert.equal(out.kind, undefined, 'short-circuit returns the value object directly')
+  const value = out.value
+  assert.equal(value.kind, 'foreground')
+  assert.equal(value.exitCode, 0)
+  assert.equal(value.stdout.text, 'file1\nfile2\n')
+  // the rewritten command is run via bash -c
+  const execSpawn = spawnLog.find((e) => e.spec.argv[1] === '-c')
+  assert.ok(execSpawn, 'must spawn a shell for the rewritten command')
+  assert.equal(execSpawn.spec.argv[0], '/bin/bash')
+  assert.equal(execSpawn.spec.argv[2], 'rtk ls -la')
+})
+
+test('hook mode execute falls through to next() when no plan exists', async () => {
+  const spawnLog = []
+  const t = mount({ spawnLog })
+  await t.runCommand('set mode hook')
+  const { out, nextCalled } = await exec(t, 'call-no-plan', 'ls')
+  assert.equal(nextCalled, true)
+  assert.equal(out.kind, 'next')
+  assert.equal(spawnLog.length, 0, 'no spawn when no plan')
+})
+
+test('hook mode execute falls through to next() when the rewritten spawn throws', async () => {
+  const t = mount({
+    spawnResult: (spec) => {
+      if (spec.argv[1] === '-c') throw new Error('boom')
+      return { outcome: { exitCode: 0, signal: null }, stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls' } } }) }
+    }
+  })
+  await t.runCommand('set mode hook')
+  await pre(t, 'call-throw', 'ls')
+  const { out, nextCalled } = await exec(t, 'call-throw', 'ls')
+  assert.equal(nextCalled, true, 'spawn failure must fall through to original command')
+  assert.equal(out.kind, 'next')
+})
+
+test('hook mode execute returns timedOut result (no fallthrough) when the rewritten spawn times out', async () => {
+  const t = mount({
+    spawnResult: (spec) => {
+      if (spec.argv[1] === '-c') {
+        return new Promise(() => {}) // never settles; timer fires first
+      }
+      return { outcome: { exitCode: 0, signal: null }, stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls' } } }) }
+    }
+  })
+  await t.runCommand('set mode hook')
+  await pre(t, 'call-timeout', 'ls')
+  const { out, nextCalled } = await exec(t, 'call-timeout', 'ls')
+  assert.equal(nextCalled, false, 'timeout must NOT fall through (original may have run partially)')
+  assert.equal(out.value.timedOut, true)
+  assert.equal(out.value.exitCode, null)
 })

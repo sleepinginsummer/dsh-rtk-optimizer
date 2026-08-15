@@ -483,6 +483,65 @@ return {
       return next()
     })
 
+    // ── tools/execute: hook mode replaces execution with `rtk <cmd>` ──
+    ctx.on('tools/execute', async (exec, next) => {
+      if (!config.enabled || config.mode !== 'hook' || exec.name !== 'bash') return next()
+      const rewritten = state.hookPlan.get(exec.callId)
+      if (rewritten === undefined) return next()
+      state.hookPlan.delete(exec.callId)
+      const cwd = sessionCwd(exec)
+      if (cwd === undefined) return next()
+      const timeoutMs = exec.arguments && Number.isFinite(exec.arguments.timeoutMs) && exec.arguments.timeoutMs > 0
+        ? exec.arguments.timeoutMs
+        : 120000
+      try {
+        const handle = subprocess.spawn({
+          argv: ['/bin/bash', '-c', rewritten],
+          cwd,
+          stdio: {
+            stdin: 'ignore',
+            stdout: { maxBytes: 1000000, spill: { maxBytes: 10000000 } },
+            stderr: { maxBytes: 100000, spill: { maxBytes: 1000000 } }
+          },
+          graceMs: 300,
+          signal: exec.signal
+        })
+        let outcome
+        if (timer !== undefined) {
+          outcome = await Promise.race([
+            handle.done,
+            timer.timeout(timeoutMs).then(() => { handle.terminate(); return undefined })
+          ])
+        } else {
+          outcome = await handle.done
+        }
+        const readStream = async (reader) => {
+          if (!reader) return { text: '', truncated: false }
+          const read = await reader.readFrom(0)
+          return { text: read.text, truncated: read.lossy === true }
+        }
+        const stdout = await readStream(handle.collected && handle.collected.stdout)
+        const stderr = await readStream(handle.collected && handle.collected.stderr)
+        const timedOut = outcome === undefined
+        state.hookExecuted.set(exec.callId, rewritten)
+        return {
+          value: {
+            kind: 'foreground',
+            exitCode: timedOut ? null : outcome.exitCode,
+            signal: timedOut ? 'SIGTERM' : outcome.signal,
+            timedOut,
+            aborted: exec.signal && exec.signal.aborted === true,
+            timeoutMs,
+            stdout,
+            stderr
+          }
+        }
+      } catch (e) {
+        if (config.debug) console.error(`dsh-rtk-optimizer: hook execute threw: ${errText(e)}`)
+        return next()
+      }
+    })
+
     // ── tools/post-execute: output compaction + suggestion note ──
     ctx.on('tools/post-execute', async (exec, result, next) => {
       const suggestion = state.suggestions.get(exec.callId)
