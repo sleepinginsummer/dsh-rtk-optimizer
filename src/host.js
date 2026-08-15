@@ -25,7 +25,7 @@
 //PURE-CORE-START
 const DEFAULT_CONFIG = {
   enabled: true,
-  mode: 'suggest', // 'rewrite' | 'suggest'
+  mode: 'suggest', // 'suggest' | 'rewrite' | 'hook'
   guardWhenRtkMissing: true,
   rewriteTimeoutMs: 2000,
   suggestNoteMaxCommands: 1,
@@ -276,8 +276,19 @@ const rtkCore = {
 // ============================================================================
 const COMPACT_TOOL_NAMES = new Set(['bash', 'grep', 'read'])
 const RTK_MISSING_TTL_MS = 60000
+// Upper bound on per-call bookkeeping maps (suggestions, hookPlan,
+// hookExecuted) so a call that plans but never resolves cannot leak memory.
+const HOOK_PLAN_MAX = 64
 function errText(e) {
   return e && typeof e === 'object' && typeof e.message === 'string' ? e.message : String(e)
+}
+// Cap a Map at HOOK_PLAN_MAX by evicting the insertion-ordering oldest entry.
+function capMap(map) {
+  while (map.size > HOOK_PLAN_MAX) {
+    const oldest = map.keys().next().value
+    if (oldest === undefined) break
+    map.delete(oldest)
+  }
 }
 
 return {
@@ -472,6 +483,7 @@ return {
       }
       if (config.mode === 'hook') {
         state.hookPlan.set(exec.callId, rewritten)
+        capMap(state.hookPlan)
         return next()
       }
       // suggest mode: remember for post-execute enrichment
@@ -518,12 +530,17 @@ return {
         const readStream = async (reader) => {
           if (!reader) return { text: '', truncated: false }
           const read = await reader.readFrom(0)
-          return { text: read.text, truncated: read.lossy === true }
+          return {
+            text: read.text,
+            truncated: read.lossy === true,
+            ...(read.spillPath !== undefined ? { spillPath: read.spillPath } : {})
+          }
         }
         const stdout = await readStream(handle.collected && handle.collected.stdout)
         const stderr = await readStream(handle.collected && handle.collected.stderr)
         const timedOut = outcome === undefined
         state.hookExecuted.set(exec.callId, rewritten)
+        capMap(state.hookExecuted)
         return {
           value: {
             kind: 'foreground',
@@ -578,6 +595,9 @@ return {
       }
 
       // hook mode: prefix a note that the command was replaced by its rtk form
+      // Also clean any hookPlan entry so a planned-but-never-executed call
+      // (deny / scheduling error) leaks no bookkeeping.
+      state.hookPlan.delete(exec.callId)
       const hookExecuted = state.hookExecuted.get(exec.callId)
       state.hookExecuted.delete(exec.callId)
       if (hookExecuted !== undefined && !result.isError) {

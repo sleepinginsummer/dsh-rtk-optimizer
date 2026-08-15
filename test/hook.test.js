@@ -39,13 +39,16 @@ function mount(opts = {}) {
     const outcome = r?.outcome ?? { exitCode: 0, signal: null }
     const stdoutText = r?.stdout ?? ''
     const stderrText = r?.stderr ?? ''
+    // Optional spill-path fakes so readStream's spillPath propagation can be tested.
+    const stdoutSpill = r?.stdoutSpill
+    const stderrSpill = r?.stderrSpill
     const terminated = { terminated: false }
     return {
       done: Promise.resolve(outcome),
       terminate: () => { terminated.terminated = true },
       collected: {
-        stdout: { readFrom: async () => ({ text: stdoutText, nextOffset: stdoutText.length, lossy: false }) },
-        stderr: { readFrom: async () => ({ text: stderrText, nextOffset: stderrText.length, lossy: false }) }
+        stdout: { readFrom: async () => ({ text: stdoutText, nextOffset: stdoutText.length, lossy: false, ...(stdoutSpill !== undefined ? { spillPath: stdoutSpill } : {}) }) },
+        stderr: { readFrom: async () => ({ text: stderrText, nextOffset: stderrText.length, lossy: false, ...(stderrSpill !== undefined ? { spillPath: stderrSpill } : {}) }) }
       }
     }
   }
@@ -283,4 +286,108 @@ test('hook mode post-execute attaches no note when the command was not replaced'
   const { out, nextCalled } = await post(t, 'call-note-2', result)
   assert.equal(nextCalled, true, 'no note, no compaction → fall through unchanged')
   assert.equal(out.kind, 'next')
+})
+
+// ── Final review fixes: F1 (bounded maps) ───────────────────────────────────
+
+test('hook mode bounded maps: hookPlan evicts oldest beyond 64 distinct plans', async () => {
+  const t = mount({
+    spawnResult: (spec) => {
+      if (spec.argv[1] === 'hook') {
+        return { outcome: { exitCode: 0, signal: null }, stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk rewrite' } } }) }
+      }
+      // rewritten command execution
+      return { outcome: { exitCode: 0, signal: null }, stdout: 'ok\n', stderr: '' }
+    }
+  })
+  await t.runCommand('set mode hook')
+  // Plan 65 distinct commands (65 hookPlan entries). Only the first is kept;
+  // entry `call-cap-0` is the oldest and must be evicted.
+  for (let i = 0; i < 65; i++) {
+    const { nextCalled } = await pre(t, `call-cap-${i}`, `echo ${i}`)
+    assert.equal(nextCalled, true, `pre must allow call-cap-${i}`)
+  }
+  // The oldest plan was evicted → execute falls through to next() (no plan).
+  const oldestFirst = await exec(t, 'call-cap-0', 'echo 0')
+  assert.equal(oldestFirst.nextCalled, true, 'oldest plan must be evicted by the cap')
+  assert.equal(oldestFirst.out.kind, 'next')
+  // A more recent plan survives → execute short-circuits.
+  const newest = await exec(t, 'call-cap-63', 'echo 63')
+  assert.equal(newest.nextCalled, false, 'a plan within the cap must survive')
+  assert.equal(newest.out.value.kind, 'foreground')
+})
+
+test('hook mode bounded maps: hookExecuted evicts oldest beyond 64 so its post-execute note is dropped', async () => {
+  const t = mount({
+    spawnResult: (spec) => {
+      if (spec.argv[1] === 'hook') {
+        return { outcome: { exitCode: 0, signal: null }, stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk rewrite' } } }) }
+      }
+      return { outcome: { exitCode: 0, signal: null }, stdout: 'ok\n', stderr: '' }
+    }
+  })
+  await t.runCommand('set mode hook')
+  // Fully execute 65 distinct commands so hookExecuted grows to 65 and evicts
+  // the oldest call-cap-0 entry.
+  for (let i = 0; i < 65; i++) {
+    await pre(t, `call-e-${i}`, `echo ${i}`)
+    await exec(t, `call-e-${i}`, `echo ${i}`)
+  }
+  // call-e-0 was executed but its hookExecuted entry was evicted → post-execute
+  // attaches no note and falls through (nextCalled true).
+  const result = { isError: false, content: [{ type: 'text', text: 'ok\n' }] }
+  const { out, nextCalled } = await post(t, 'call-e-0', result)
+  assert.equal(nextCalled, true, 'evicted executed-entry must drop the hook note')
+  assert.equal(out.kind, 'next')
+})
+
+test('hook mode post-execute clears a planned-but-not-executed hookPlan entry', async () => {
+  const t = mount({
+    spawnResult: (spec) => {
+      if (spec.argv[1] === 'hook') {
+        return { outcome: { exitCode: 0, signal: null }, stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk rewrite' } } }) }
+      }
+      return { outcome: { exitCode: 0, signal: null }, stdout: 'ok\n', stderr: '' }
+    }
+  })
+  await t.runCommand('set mode hook')
+  // pre-execute plans the rewrite but execute never runs (downstream deny /
+  // scheduling error). post-execute must still clean the hookPlan entry so it
+  // does not leak.
+  await pre(t, 'call-cleaned', 'echo hi')
+  const result = { isError: true, content: [] }
+  const { nextCalled } = await post(t, 'call-cleaned', result)
+  assert.equal(nextCalled, true, 'post-execute itself has nothing to do')
+  // The plan was cleaned: re-running pre must re-plan (proving no stale entry)
+  // and, more directly, execute must fall through (plan was removed).
+  const { out, nextCalled: execNC } = await exec(t, 'call-cleaned', 'echo hi')
+  assert.equal(execNC, true, 'planned-but-not-executed entry cleaned by post-execute')
+  assert.equal(out.kind, 'next')
+})
+
+// ── Final review fixes: F2 (spillPath propagation) ──────────────────────────
+
+test('hook mode execute propagates spillPath from the rewritten stdout/stderr streams', async () => {
+  const t = mount({
+    spawnResult: (spec) => {
+      if (spec.argv[1] === 'hook') {
+        return { outcome: { exitCode: 0, signal: null }, stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls big' } } }) }
+      }
+      // rewritten command execution spills both streams
+      return {
+        outcome: { exitCode: 0, signal: null },
+        stdout: 'big output\n',
+        stdoutSpill: '/tmp/spilled-stdout.log',
+        stderr: 'err\n',
+        stderrSpill: '/tmp/spilled-stderr.log'
+      }
+    }
+  })
+  await t.runCommand('set mode hook')
+  await pre(t, 'call-spill', 'ls big')
+  const { out, nextCalled } = await exec(t, 'call-spill', 'ls big')
+  assert.equal(nextCalled, false, 'execute must short-circuit')
+  assert.equal(out.value.stdout.text, 'big output\n')
+  assert.equal(out.value.stdout.spillPath, '/tmp/spilled-stdout.log', 'stdout spillPath must propagate')
+  assert.equal(out.value.stderr.spillPath, '/tmp/spilled-stderr.log', 'stderr spillPath must propagate')
 })
