@@ -313,10 +313,12 @@ return {
     }
 
     // ── rtk binary access ──
-    async function resolveRtk(signal) {
+    // `force` bypasses the missing-binary cache so an explicit user command
+    // (/rtk verify, /rtk show) always gets an authoritative, fresh answer.
+    async function resolveRtk(signal, force = false) {
       if (subprocess === undefined) return undefined
       const stale = state.rtkCheckedAt === 0 || now() - state.rtkCheckedAt > RTK_MISSING_TTL_MS
-      if (state.rtkResolved !== undefined && !stale) return state.rtkResolved
+      if (!force && state.rtkResolved !== undefined && !stale) return state.rtkResolved
       try {
         const exe = await subprocess.resolveExecutable('rtk', undefined, signal)
         state.rtkResolved = exe
@@ -468,7 +470,7 @@ return {
         name: 'rtk',
         description: 'RTK optimizer status: show config, verify the rtk binary, or show compaction stats.',
         input: { hint: 'show | verify | stats | clear-stats | reset | help' },
-        handler: (invocation) => {
+        handler: async (invocation) => {
           const line = invocation.rawInput.trim()
           try {
             const c = cfg()
@@ -496,9 +498,10 @@ return {
                 return { kind: 'error', text: 'usage: /rtk set <key> <value> — keys: mode (suggest|rewrite), enabled (true|false), guardWhenRtkMissing (true|false), readCompaction (true|false)' }
               }
               case 'show': {
-                const rtkState = state.rtkResolved === undefined ? 'unknown (not probed yet)'
-                  : state.rtkResolved === null ? 'missing'
-                    : state.rtkResolved
+                // Probe (fresh) so the status is truthful even before the first
+                // bash call — previously it stayed "not probed yet" forever.
+                const exe = await resolveRtk(undefined, true)
+                const rtkState = exe === undefined ? 'missing' : exe
                 return {
                   kind: 'success',
                   text: [
@@ -513,9 +516,10 @@ return {
                 }
               }
               case 'verify': {
-                const exe = state.rtkResolved
-                if (exe === undefined) return { kind: 'success', text: 'rtk binary: not probed yet (runs on the next bash call, or install rtk and run /rtk verify again)' }
-                if (exe === null) return { kind: 'success', text: 'rtk binary: NOT FOUND on PATH (rewrites disabled, original commands run unchanged)' }
+                // The point of "verify" is to check the binary NOW: force a
+                // fresh probe instead of reporting the stale cached state.
+                const exe = await resolveRtk(undefined, true)
+                if (exe === undefined) return { kind: 'success', text: 'rtk binary: NOT FOUND on PATH (rewrites disabled, original commands run unchanged)' }
                 return { kind: 'success', text: `rtk binary: ${exe}` }
               }
               case 'stats': {
