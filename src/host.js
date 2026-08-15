@@ -297,7 +297,9 @@ return {
       rtkCheckedAt: 0,
       stats: { calls: 0, compacted: 0, savedChars: 0, byTool: {} },
       suggestions: new Map(), // callId → rewritten command (suggest mode)
-      denyGuard: new Map() // command → last deny ts (anti-loop)
+      denyGuard: new Map(), // command → last deny ts (anti-loop)
+      hookPlan: new Map(), // callId → rewritten command (hook mode)
+      hookExecuted: new Map() // callId → rewritten command actually executed (for post-execute note)
     }
 
     function sessionCwd(exec) {
@@ -370,6 +372,63 @@ return {
       }
     }
 
+    // ── rtk hook-mode rewrite: consult the rtk agent-hook engine (`rtk hook claude`)
+    // Reads a Claude Code PreToolUse event from stdin and returns the rewritten
+    // command from `updatedInput.command`, or undefined when rtk suggests no change.
+    async function rtkHookRewrite(exe, cwd, command, signal) {
+      const payload = JSON.stringify({
+        session_id: 'dsh-rtk-optimizer',
+        cwd,
+        hook_event_name: 'PreToolUse',
+        tool_name: 'Bash',
+        tool_input: { command }
+      })
+      try {
+        const handle = subprocess.spawn({
+          argv: [exe, 'hook', 'claude'],
+          cwd,
+          stdio: {
+            stdin: { data: payload },
+            stdout: { maxBytes: 8192 },
+            stderr: { maxBytes: 4096 }
+          },
+          graceMs: 300,
+          signal
+        })
+        let outcome
+        if (timer !== undefined && config.rewriteTimeoutMs > 0) {
+          outcome = await Promise.race([
+            handle.done,
+            timer.timeout(config.rewriteTimeoutMs).then(() => { handle.terminate(); return undefined })
+          ])
+        } else {
+          outcome = await handle.done
+        }
+        if (!outcome || outcome.exitCode !== 0) {
+          if (config.debug) console.error(`dsh-rtk-optimizer: rtk hook exit=${outcome ? outcome.exitCode : 'timeout'}`)
+          return undefined
+        }
+        const reader = handle.collected && handle.collected.stdout
+        const text = reader ? (await reader.readFrom(0)).text : ''
+        if (!text) return undefined
+        let parsed
+        try {
+          parsed = JSON.parse(text)
+        } catch (e) {
+          if (config.debug) console.error(`dsh-rtk-optimizer: rtk hook output not JSON: ${errText(e)}`)
+          return undefined
+        }
+        const rewritten = parsed && parsed.hookSpecificOutput && parsed.hookSpecificOutput.updatedInput
+          ? parsed.hookSpecificOutput.updatedInput.command
+          : undefined
+        if (config.debug) console.error(`dsh-rtk-optimizer: rtk hook of "${command}" → "${rewritten}"`)
+        return typeof rewritten === 'string' && rewritten.length > 0 && rewritten !== command ? rewritten : undefined
+      } catch (e) {
+        if (config.debug) console.error(`dsh-rtk-optimizer: rtk hook threw: ${errText(e)}`)
+        return undefined
+      }
+    }
+
     // ── tools/pre-execute: rtk rewrite suggestion / deny ──
     ctx.on('tools/pre-execute', async (exec, next) => {
       if (!config.enabled || exec.name !== 'bash') return next()
@@ -390,7 +449,9 @@ return {
         }
         return next()
       }
-      const rewritten = await rtkRewrite(exe, cwd, command, exec.signal)
+      const rewritten = config.mode === 'hook'
+        ? await rtkHookRewrite(exe, cwd, command, exec.signal)
+        : await rtkRewrite(exe, cwd, command, exec.signal)
       if (rewritten === undefined) {
         if (config.debug && !state.rewriteFailureNoted) {
           state.rewriteFailureNoted = true
@@ -408,6 +469,10 @@ return {
           kind: 'deny',
           reason: `[rtk-optimizer] Run this rtk-rewritten command instead (${rewritten.length} chars, was ${command.length}):\n${rewritten}`
         }
+      }
+      if (config.mode === 'hook') {
+        state.hookPlan.set(exec.callId, rewritten)
+        return next()
       }
       // suggest mode: remember for post-execute enrichment
       state.suggestions.set(exec.callId, rewritten)

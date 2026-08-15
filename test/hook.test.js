@@ -39,7 +39,11 @@ function mount(opts = {}) {
   const ctx = {
     get: (name) => {
       if (name === 'subprocess') return {
-        resolveExecutable: async () => opts.probe ?? '/usr/local/bin/rtk',
+        // `probe` IS the resolveExecutable impl: invoke it so its throw/reject
+        // propagates (task-2 missing-binary test relies on that). Default resolves.
+        resolveExecutable: async (name, _o, signal) => {
+          return typeof opts.probe === 'function' ? await opts.probe(signal) : '/usr/local/bin/rtk'
+        },
         spawn: fakeSpawn
       }
       if (name === 'timer') return { timeout: () => Promise.resolve() }
@@ -109,4 +113,54 @@ test('/rtk help lists hook mode', async () => {
   const out = await t.runCommand('help')
   assert.equal(out.kind, 'success')
   assert.match(out.text, /hook/)
+})
+
+// ── Task 2: pre-execute hook branch ─────────────────────────────────────────
+
+test('hook mode pre-execute spawns `rtk hook claude` with PreToolUse JSON stdin and plans the rewrite', async () => {
+  const spawnLog = []
+  const t = mount({
+    spawnLog,
+    spawnResult: {
+      outcome: { exitCode: 0, signal: null },
+      stdout: JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          updatedInput: { command: 'rtk ls -la' }
+        }
+      })
+    }
+  })
+  await t.runCommand('set mode hook')
+  const { out, nextCalled } = await pre(t, 'call-1', 'ls -la')
+  assert.equal(nextCalled, true, 'pre-execute must allow (not deny)')
+  assert.equal(out.kind, 'next')
+  assert.equal(spawnLog.length, 1, 'exactly one spawn for the hook call')
+  const spec = spawnLog[0].spec
+  assert.deepEqual(spec.argv, ['/usr/local/bin/rtk', 'hook', 'claude'])
+  assert.equal(typeof spec.stdio.stdin.data, 'string')
+  const payload = JSON.parse(spec.stdio.stdin.data)
+  assert.equal(payload.hook_event_name, 'PreToolUse')
+  assert.equal(payload.tool_name, 'Bash')
+  assert.equal(payload.tool_input.command, 'ls -la')
+})
+
+test('hook mode pre-execute plans nothing when rtk hook returns no rewrite (empty stdout)', async () => {
+  const spawnLog = []
+  const t = mount({ spawnLog, spawnResult: { outcome: { exitCode: 0, signal: null }, stdout: '' } })
+  await t.runCommand('set mode hook')
+  const { nextCalled } = await pre(t, 'call-2', 'echo hi')
+  assert.equal(nextCalled, true)
+  assert.equal(spawnLog.length, 1, 'hook was consulted once')
+  // second pre-execute must not spawn again for the same call after execute consumed the plan:
+  // (execute consumption is Task 3; here we only assert pre-execute allows)
+})
+
+test('hook mode pre-execute allows when rtk binary is missing', async () => {
+  const spawnLog = []
+  const t = mount({ spawnLog, probe: async () => { throw new Error('not found') } })
+  await t.runCommand('set mode hook')
+  const { out, nextCalled } = await pre(t, 'call-3', 'ls')
+  assert.equal(nextCalled, true)
+  assert.equal(spawnLog.length, 0, 'no hook spawn when rtk missing')
 })
