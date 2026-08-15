@@ -479,7 +479,7 @@ return {
               case 'set': {
                 const key = rest[0]
                 const value = rest[1]
-                if (key === 'mode' && (value === 'suggest' || value === 'rewrite')) {
+                if (key === 'mode' && (value === 'suggest' || value === 'rewrite' || value === 'hook')) {
                   c.mode = value
                   return { kind: 'success', text: `rtk-optimizer mode set to ${value}.` }
                 }
@@ -495,7 +495,7 @@ return {
                   c.outputCompaction.readCompaction = value === 'true'
                   return { kind: 'success', text: `rtk-optimizer readCompaction=${c.outputCompaction.readCompaction}.` }
                 }
-                return { kind: 'error', text: 'usage: /rtk set <key> <value> — keys: mode (suggest|rewrite), enabled (true|false), guardWhenRtkMissing (true|false), readCompaction (true|false)' }
+                return { kind: 'error', text: 'usage: /rtk set <key> <value> — keys: mode (suggest|rewrite|hook), enabled (true|false), guardWhenRtkMissing (true|false), readCompaction (true|false)' }
               }
               case 'show': {
                 // Probe (fresh) so the status is truthful even before the first
@@ -551,7 +551,7 @@ return {
               case '': {
                 return {
                   kind: 'success',
-                  text: 'rtk-optimizer: /rtk [show|verify|stats|clear-stats|reset|set|help]\n  show        current configuration and runtime status\n  verify      check whether the rtk binary is available\n  stats       compaction savings for this process\n  clear-stats reset the counters\n  set         /rtk set <key> <value> (mode|enabled|guardWhenRtkMissing|readCompaction)\n  reset       restore default configuration'
+                  text: 'rtk-optimizer: /rtk [show|verify|stats|clear-stats|reset|set|help]\n  show        current configuration and runtime status\n  verify      check whether the rtk binary is available\n  stats       compaction savings for this process\n  clear-stats reset the counters\n  set         /rtk set <key> <value> (mode(suggest|rewrite|hook)|enabled|guardWhenRtkMissing|readCompaction)\n  reset       restore default configuration'
                 }
               }
               default:
