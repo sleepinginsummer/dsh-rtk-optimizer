@@ -18,7 +18,10 @@ RTK 命令改写建议 + 工具输出压缩——DSH 插件（Host 拦截器）�
   获取改写，并在 `tools/execute` 短路，让命令真正以 `rtk <cmd>` 形式执行（输出经 rtk 过滤，
   `rtk gain` 的 `Total commands` 会计数 +1）。**默认无感**：模型看到的就是 rtk 过滤后的输出，
   不附加任何标注；`/rtk set debug true` 时会在结果前标注 `[rtk-optimizer] hook: executed as "..."`（排查用）。
-  ⚠️ **安全**：此模式绕过 DSH 的 bash sandbox（原命令由 rtk 包装器直接执行），请仅在可信环境开启。
+  ⚠️ **安全警告**：此模式会把**所有 bash 命令静默交给第三方软件（rtk）执行**——命令本身、
+  其参数与运行结果都会经过 rtk 处理（rtk 可记录到本地 `history.db`，且其改写/过滤逻辑作为
+  第三方闭源二进制不可审计）。同时**绕过 DSH 的 bash sandbox**（原命令由 rtk 包装器直接执行）。
+  仅在你信任 rtk 且环境允许命令外发时开启；涉及敏感数据或不可信机器的会话请勿启用。
 
 > DSH 工具参数在分发管道中不可变（`tools/execute` 只能改 `exec.signal`），因此 `rewrite`/`suggest` 模式无法自动改写命令（deny+反馈是架构允许下最接近自动改写的语义）；`hook` 模式例外——它通过 `tools/execute` 短路替换执行，命令真正以 `rtk <cmd>` 形式运行（见上）。
 > `rtk` 未安装时：原命令原样执行（`guardWhenRtkMissing: true`），探测结果缓存 60s，不重复 probe。
