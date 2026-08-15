@@ -25,7 +25,7 @@
 //PURE-CORE-START
 const DEFAULT_CONFIG = {
   enabled: true,
-  mode: 'suggest', // 'rewrite' | 'suggest'
+  mode: 'suggest', // 'suggest' | 'rewrite' | 'hook'
   guardWhenRtkMissing: true,
   rewriteTimeoutMs: 2000,
   suggestNoteMaxCommands: 1,
@@ -276,8 +276,19 @@ const rtkCore = {
 // ============================================================================
 const COMPACT_TOOL_NAMES = new Set(['bash', 'grep', 'read'])
 const RTK_MISSING_TTL_MS = 60000
+// Upper bound on per-call bookkeeping maps (suggestions, hookPlan,
+// hookExecuted) so a call that plans but never resolves cannot leak memory.
+const HOOK_PLAN_MAX = 64
 function errText(e) {
   return e && typeof e === 'object' && typeof e.message === 'string' ? e.message : String(e)
+}
+// Cap a Map at HOOK_PLAN_MAX by evicting the insertion-ordering oldest entry.
+function capMap(map) {
+  while (map.size > HOOK_PLAN_MAX) {
+    const oldest = map.keys().next().value
+    if (oldest === undefined) break
+    map.delete(oldest)
+  }
 }
 
 return {
@@ -285,11 +296,24 @@ return {
   // (static mount: bundle rows load in parallel; without this, apply() could
   // run before subprocess/commands/timer are mounted and silently degrade).
   inject: ['subprocess', 'commands', 'timer'],
-  apply(ctx) {
+  apply(ctx, injected) {
     const subprocess = ctx.get('subprocess')
     const commands = ctx.get('commands')
     const timer = ctx.get('timer')
-    const config = { ...DEFAULT_CONFIG }
+    const fs = ctx.get('fs')
+    const config = {
+      ...DEFAULT_CONFIG,
+      ...(injected && typeof injected === 'object' ? injected : {})
+    }
+    // Persisted settings file. `config.persistFile` wins; else DSH_HOME
+    // profile patch (web) or a plain home fallback.
+    const homeDir = typeof process !== 'undefined' && process.env ? process.env.HOME : undefined
+    const dshHome = typeof process !== 'undefined' && process.env ? process.env.DSH_HOME : undefined
+    const persistFile = typeof config.persistFile === 'string' && config.persistFile.length > 0
+      ? config.persistFile
+      : (dshHome
+        ? `${dshHome}/profiles/web/cordis.patch.yml`
+        : (homeDir ? `${homeDir}/.dsh/profiles/web/cordis.patch.yml` : ''))
 
     // ── Runtime state ──
     const state = {
@@ -297,7 +321,9 @@ return {
       rtkCheckedAt: 0,
       stats: { calls: 0, compacted: 0, savedChars: 0, byTool: {} },
       suggestions: new Map(), // callId → rewritten command (suggest mode)
-      denyGuard: new Map() // command → last deny ts (anti-loop)
+      denyGuard: new Map(), // command → last deny ts (anti-loop)
+      hookPlan: new Map(), // callId → rewritten command (hook mode)
+      hookExecuted: new Map() // callId → rewritten command actually executed (for post-execute note)
     }
 
     function sessionCwd(exec) {
@@ -312,11 +338,102 @@ return {
       return Date.now()
     }
 
+    // ── Config persistence (cordis.patch.yml id-targeted override) ──
+    // The keys a user can change at runtime; everything else stays in memory.
+    const PERSIST_KEYS = ['mode', 'enabled', 'guardWhenRtkMissing', 'readCompaction', 'debug']
+
+    /** Render one `key: value` YAML line, quoting strings like `mode: hook`. */
+    function yamlValue(value) {
+      if (typeof value === 'string') return `"${value}"`
+      return String(value)
+    }
+
+    /**
+     * Update (or create) the `- id: dsh-rtk-optimizer` block's `config:` map in
+     * a cordis.patch.yml text, setting exactly `changes` (key → value) and
+     * leaving every other line untouched. Returns the new file text.
+     */
+    function applyPatchUpdate(text, changes) {
+      const lines = text.split('\n')
+      const idIdx = lines.findIndex((l) => l.trim() === '- id: dsh-rtk-optimizer')
+      if (idIdx === -1) {
+        // No block yet: append an id-targeted override at the end.
+        const block = ['- id: dsh-rtk-optimizer', '  config:']
+        for (const [k, v] of Object.entries(changes)) block.push(`    ${k}: ${yamlValue(v)}`)
+        return text.replace(/\s*$/, '\n') + block.join('\n') + '\n'
+      }
+      // Locate this block's config: map. The block spans until the next line
+      // that starts (after optional indent) with `- id:` or a bare `-`.
+      let cfgIdx = -1
+      let cfgIndent = ''
+      for (let i = idIdx + 1; i < lines.length; i++) {
+        const t = lines[i].trim()
+        if (t.startsWith('- id:') || t === '-') break
+        const m = lines[i].match(/^(\s*)config:/)
+        if (m) { cfgIdx = i; cfgIndent = m[1]; break }
+      }
+      const result = lines.slice()
+      const setKey = (key, value) => {
+        if (cfgIdx !== -1) {
+          // Does this key already exist inside the config map? (lines more
+          // indented than `config:` and not a new list item)
+          const innerIndent = cfgIndent + '  '
+          for (let i = cfgIdx + 1; i < result.length; i++) {
+            const line = result[i]
+            if (line.trim() === '' || line.trim().startsWith('#')) continue
+            if (!line.startsWith(innerIndent)) break
+            const km = line.match(/^(\s*)([A-Za-z0-9_]+):/)
+            if (km && km[2] === key) {
+              result[i] = `${innerIndent}${key}: ${yamlValue(value)}`
+              return
+            }
+          }
+          // key absent: insert right after config: (before its first child)
+          result.splice(cfgIdx + 1, 0, `${innerIndent}${key}: ${yamlValue(value)}`)
+        } else {
+          // No config: map in this block — add one after the id line.
+          const insertAt = idIdx + 1
+          result.splice(insertAt, 0, `  config:`, `    ${key}: ${yamlValue(value)}`)
+          cfgIdx = insertAt
+          cfgIndent = '  '
+        }
+      }
+      for (const [k, v] of Object.entries(changes)) setKey(k, v)
+      return result.join('\n')
+    }
+
+    /**
+     * Persist `changes` into the profile patch file via ctx.fs. No-ops with a
+     * debug log when fs is unavailable or the file cannot be written.
+     */
+    async function persistConfig(changes) {
+      if (fs === undefined || !persistFile) return false
+      try {
+        const target = await fs.resolve(persistFile)
+        let current = ''
+        try {
+          current = await fs.readText(target)
+        } catch (e) {
+          // file may not exist yet — start from an empty patch
+          if (config.debug) console.error(`dsh-rtk-optimizer: persist read failed (starting empty): ${errText(e)}`)
+        }
+        const next = applyPatchUpdate(current, changes)
+        await fs.writeText(target, next, undefined, undefined, undefined)
+        if (config.debug) console.error(`dsh-rtk-optimizer: persisted ${Object.keys(changes).join(',')} → ${persistFile}`)
+        return true
+      } catch (e) {
+        if (config.debug) console.error(`dsh-rtk-optimizer: persist failed: ${errText(e)}`)
+        return false
+      }
+    }
+
     // ── rtk binary access ──
-    async function resolveRtk(signal) {
+    // `force` bypasses the missing-binary cache so an explicit user command
+    // (/rtk verify, /rtk show) always gets an authoritative, fresh answer.
+    async function resolveRtk(signal, force = false) {
       if (subprocess === undefined) return undefined
       const stale = state.rtkCheckedAt === 0 || now() - state.rtkCheckedAt > RTK_MISSING_TTL_MS
-      if (state.rtkResolved !== undefined && !stale) return state.rtkResolved
+      if (!force && state.rtkResolved !== undefined && !stale) return state.rtkResolved
       try {
         const exe = await subprocess.resolveExecutable('rtk', undefined, signal)
         state.rtkResolved = exe
@@ -368,6 +485,63 @@ return {
       }
     }
 
+    // ── rtk hook-mode rewrite: consult the rtk agent-hook engine (`rtk hook claude`)
+    // Reads a Claude Code PreToolUse event from stdin and returns the rewritten
+    // command from `updatedInput.command`, or undefined when rtk suggests no change.
+    async function rtkHookRewrite(exe, cwd, command, signal) {
+      const payload = JSON.stringify({
+        session_id: 'dsh-rtk-optimizer',
+        cwd,
+        hook_event_name: 'PreToolUse',
+        tool_name: 'Bash',
+        tool_input: { command }
+      })
+      try {
+        const handle = subprocess.spawn({
+          argv: [exe, 'hook', 'claude'],
+          cwd,
+          stdio: {
+            stdin: { data: payload },
+            stdout: { maxBytes: 8192 },
+            stderr: { maxBytes: 4096 }
+          },
+          graceMs: 300,
+          signal
+        })
+        let outcome
+        if (timer !== undefined && config.rewriteTimeoutMs > 0) {
+          outcome = await Promise.race([
+            handle.done,
+            timer.timeout(config.rewriteTimeoutMs).then(() => { handle.terminate(); return undefined })
+          ])
+        } else {
+          outcome = await handle.done
+        }
+        if (!outcome || outcome.exitCode !== 0) {
+          if (config.debug) console.error(`dsh-rtk-optimizer: rtk hook exit=${outcome ? outcome.exitCode : 'timeout'}`)
+          return undefined
+        }
+        const reader = handle.collected && handle.collected.stdout
+        const text = reader ? (await reader.readFrom(0)).text : ''
+        if (!text) return undefined
+        let parsed
+        try {
+          parsed = JSON.parse(text)
+        } catch (e) {
+          if (config.debug) console.error(`dsh-rtk-optimizer: rtk hook output not JSON: ${errText(e)}`)
+          return undefined
+        }
+        const rewritten = parsed && parsed.hookSpecificOutput && parsed.hookSpecificOutput.updatedInput
+          ? parsed.hookSpecificOutput.updatedInput.command
+          : undefined
+        if (config.debug) console.error(`dsh-rtk-optimizer: rtk hook of "${command}" → "${rewritten}"`)
+        return typeof rewritten === 'string' && rewritten.length > 0 && rewritten !== command ? rewritten : undefined
+      } catch (e) {
+        if (config.debug) console.error(`dsh-rtk-optimizer: rtk hook threw: ${errText(e)}`)
+        return undefined
+      }
+    }
+
     // ── tools/pre-execute: rtk rewrite suggestion / deny ──
     ctx.on('tools/pre-execute', async (exec, next) => {
       if (!config.enabled || exec.name !== 'bash') return next()
@@ -388,7 +562,9 @@ return {
         }
         return next()
       }
-      const rewritten = await rtkRewrite(exe, cwd, command, exec.signal)
+      const rewritten = config.mode === 'hook'
+        ? await rtkHookRewrite(exe, cwd, command, exec.signal)
+        : await rtkRewrite(exe, cwd, command, exec.signal)
       if (rewritten === undefined) {
         if (config.debug && !state.rewriteFailureNoted) {
           state.rewriteFailureNoted = true
@@ -407,6 +583,11 @@ return {
           reason: `[rtk-optimizer] Run this rtk-rewritten command instead (${rewritten.length} chars, was ${command.length}):\n${rewritten}`
         }
       }
+      if (config.mode === 'hook') {
+        state.hookPlan.set(exec.callId, rewritten)
+        capMap(state.hookPlan)
+        return next()
+      }
       // suggest mode: remember for post-execute enrichment
       state.suggestions.set(exec.callId, rewritten)
       if (state.suggestions.size > 64) {
@@ -414,6 +595,70 @@ return {
         state.suggestions.delete(oldest)
       }
       return next()
+    })
+
+    // ── tools/execute: hook mode replaces execution with `rtk <cmd>` ──
+    ctx.on('tools/execute', async (exec, next) => {
+      if (!config.enabled || config.mode !== 'hook' || exec.name !== 'bash') return next()
+      const rewritten = state.hookPlan.get(exec.callId)
+      if (rewritten === undefined) return next()
+      state.hookPlan.delete(exec.callId)
+      const cwd = sessionCwd(exec)
+      if (cwd === undefined) return next()
+      const timeoutMs = exec.arguments && Number.isFinite(exec.arguments.timeoutMs) && exec.arguments.timeoutMs > 0
+        ? exec.arguments.timeoutMs
+        : 120000
+      try {
+        const handle = subprocess.spawn({
+          argv: ['/bin/bash', '-c', rewritten],
+          cwd,
+          stdio: {
+            stdin: 'ignore',
+            stdout: { maxBytes: 1000000, spill: { maxBytes: 10000000 } },
+            stderr: { maxBytes: 100000, spill: { maxBytes: 1000000 } }
+          },
+          graceMs: 300,
+          signal: exec.signal
+        })
+        let outcome
+        if (timer !== undefined) {
+          outcome = await Promise.race([
+            handle.done,
+            timer.timeout(timeoutMs).then(() => { handle.terminate(); return undefined })
+          ])
+        } else {
+          outcome = await handle.done
+        }
+        const readStream = async (reader) => {
+          if (!reader) return { text: '', truncated: false }
+          const read = await reader.readFrom(0)
+          return {
+            text: read.text,
+            truncated: read.lossy === true,
+            ...(read.spillPath !== undefined ? { spillPath: read.spillPath } : {})
+          }
+        }
+        const stdout = await readStream(handle.collected && handle.collected.stdout)
+        const stderr = await readStream(handle.collected && handle.collected.stderr)
+        const timedOut = outcome === undefined
+        state.hookExecuted.set(exec.callId, rewritten)
+        capMap(state.hookExecuted)
+        return {
+          value: {
+            kind: 'foreground',
+            exitCode: timedOut ? null : outcome.exitCode,
+            signal: timedOut ? 'SIGTERM' : outcome.signal,
+            timedOut,
+            aborted: exec.signal && exec.signal.aborted === true,
+            timeoutMs,
+            stdout,
+            stderr
+          }
+        }
+      } catch (e) {
+        if (config.debug) console.error(`dsh-rtk-optimizer: hook execute threw: ${errText(e)}`)
+        return next()
+      }
     })
 
     // ── tools/post-execute: output compaction + suggestion note ──
@@ -451,6 +696,22 @@ return {
         }
       }
 
+      // hook mode: the command was replaced by its rtk form — invisible by
+      // default (true "hook"), with a debug-gated note for diagnostics.
+      // Also clean any hookPlan entry so a planned-but-never-executed call
+      // (deny / scheduling error) leaks no bookkeeping.
+      state.hookPlan.delete(exec.callId)
+      const hookExecuted = state.hookExecuted.get(exec.callId)
+      state.hookExecuted.delete(exec.callId)
+      if (config.debug && hookExecuted !== undefined && !result.isError) {
+        const note = `[rtk-optimizer] hook: executed as "${hookExecuted}"`
+        const blocks = result.content
+        const existing = blocks.some((b) => b && b.type === 'text' && typeof b.text === 'string' && b.text.includes('[rtk-optimizer]'))
+        if (!existing) {
+          compactedBlocks = [{ type: 'text', text: note }, ...(compactedBlocks ?? blocks)]
+        }
+      }
+
       if (compactedBlocks === undefined) return next()
 
       state.stats.calls += 1
@@ -468,7 +729,7 @@ return {
         name: 'rtk',
         description: 'RTK optimizer status: show config, verify the rtk binary, or show compaction stats.',
         input: { hint: 'show | verify | stats | clear-stats | reset | help' },
-        handler: (invocation) => {
+        handler: async (invocation) => {
           const line = invocation.rawInput.trim()
           try {
             const c = cfg()
@@ -477,28 +738,34 @@ return {
               case 'set': {
                 const key = rest[0]
                 const value = rest[1]
-                if (key === 'mode' && (value === 'suggest' || value === 'rewrite')) {
+                const changes = {}
+                if (key === 'mode' && (value === 'suggest' || value === 'rewrite' || value === 'hook')) {
                   c.mode = value
-                  return { kind: 'success', text: `rtk-optimizer mode set to ${value}.` }
-                }
-                if (key === 'enabled' && (value === 'true' || value === 'false')) {
+                  changes.mode = value
+                } else if (key === 'enabled' && (value === 'true' || value === 'false')) {
                   c.enabled = value === 'true'
-                  return { kind: 'success', text: `rtk-optimizer enabled=${c.enabled}.` }
-                }
-                if (key === 'guardWhenRtkMissing' && (value === 'true' || value === 'false')) {
+                  changes.enabled = value === 'true'
+                } else if (key === 'guardWhenRtkMissing' && (value === 'true' || value === 'false')) {
                   c.guardWhenRtkMissing = value === 'true'
-                  return { kind: 'success', text: `rtk-optimizer guardWhenRtkMissing=${c.guardWhenRtkMissing}.` }
-                }
-                if (key === 'readCompaction' && (value === 'true' || value === 'false')) {
+                  changes.guardWhenRtkMissing = value === 'true'
+                } else if (key === 'readCompaction' && (value === 'true' || value === 'false')) {
                   c.outputCompaction.readCompaction = value === 'true'
-                  return { kind: 'success', text: `rtk-optimizer readCompaction=${c.outputCompaction.readCompaction}.` }
+                  changes.readCompaction = value === 'true'
+                } else if (key === 'debug' && (value === 'true' || value === 'false')) {
+                  c.debug = value === 'true'
+                  changes.debug = value === 'true'
+                } else {
+                  return { kind: 'error', text: 'usage: /rtk set <key> <value> — keys: mode (suggest|rewrite|hook), enabled (true|false), guardWhenRtkMissing (true|false), readCompaction (true|false), debug (true|false)' }
                 }
-                return { kind: 'error', text: 'usage: /rtk set <key> <value> — keys: mode (suggest|rewrite), enabled (true|false), guardWhenRtkMissing (true|false), readCompaction (true|false)' }
+                const persisted = await persistConfig(changes)
+                const suffix = persisted ? '' : ' (not persisted)'
+                return { kind: 'success', text: `rtk-optimizer ${key}=${value}.${suffix}` }
               }
               case 'show': {
-                const rtkState = state.rtkResolved === undefined ? 'unknown (not probed yet)'
-                  : state.rtkResolved === null ? 'missing'
-                    : state.rtkResolved
+                // Probe (fresh) so the status is truthful even before the first
+                // bash call — previously it stayed "not probed yet" forever.
+                const exe = await resolveRtk(undefined, true)
+                const rtkState = exe === undefined ? 'missing' : exe
                 return {
                   kind: 'success',
                   text: [
@@ -513,9 +780,10 @@ return {
                 }
               }
               case 'verify': {
-                const exe = state.rtkResolved
-                if (exe === undefined) return { kind: 'success', text: 'rtk binary: not probed yet (runs on the next bash call, or install rtk and run /rtk verify again)' }
-                if (exe === null) return { kind: 'success', text: 'rtk binary: NOT FOUND on PATH (rewrites disabled, original commands run unchanged)' }
+                // The point of "verify" is to check the binary NOW: force a
+                // fresh probe instead of reporting the stale cached state.
+                const exe = await resolveRtk(undefined, true)
+                if (exe === undefined) return { kind: 'success', text: 'rtk binary: NOT FOUND on PATH (rewrites disabled, original commands run unchanged)' }
                 return { kind: 'success', text: `rtk binary: ${exe}` }
               }
               case 'stats': {
@@ -541,13 +809,16 @@ return {
               }
               case 'reset': {
                 Object.assign(config, JSON.parse(JSON.stringify(DEFAULT_CONFIG)))
-                return { kind: 'success', text: 'rtk-optimizer config reset to defaults.' }
+                const changes = {}
+                for (const k of PERSIST_KEYS) changes[k] = config[k]
+                const persisted = await persistConfig(changes)
+                return { kind: 'success', text: `rtk-optimizer config reset to defaults.${persisted ? '' : ' (not persisted)'}` }
               }
               case 'help':
               case '': {
                 return {
                   kind: 'success',
-                  text: 'rtk-optimizer: /rtk [show|verify|stats|clear-stats|reset|set|help]\n  show        current configuration and runtime status\n  verify      check whether the rtk binary is available\n  stats       compaction savings for this process\n  clear-stats reset the counters\n  set         /rtk set <key> <value> (mode|enabled|guardWhenRtkMissing|readCompaction)\n  reset       restore default configuration'
+                  text: 'rtk-optimizer: /rtk [show|verify|stats|clear-stats|reset|set|help]\n  show        current configuration and runtime status\n  verify      check whether the rtk binary is available\n  stats       compaction savings for this process\n  clear-stats reset the counters\n  set         /rtk set <key> <value> (mode(suggest|rewrite|hook)|enabled|guardWhenRtkMissing|readCompaction)\n  reset       restore default configuration'
                 }
               }
               default:
