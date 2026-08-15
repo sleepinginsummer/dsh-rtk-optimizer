@@ -254,7 +254,7 @@ test('hook mode execute returns timedOut result (no fallthrough) when the rewrit
 
 // ── Task 4: post-execute hook note ──────────────────────────────────────────
 
-test('hook mode post-execute prefixes the executed-as note when the command was replaced', async () => {
+test('hook mode post-execute prefixes the executed-as note only in debug mode', async () => {
   const t = mount({
     spawnResult: (spec) => {
       if (spec.argv[1] === 'hook') {
@@ -264,6 +264,7 @@ test('hook mode post-execute prefixes the executed-as note when the command was 
     }
   })
   await t.runCommand('set mode hook')
+  await t.runCommand('set debug true')
   await pre(t, 'call-note-1', 'ls -la')
   await exec(t, 'call-note-1', 'ls -la')
   const result = {
@@ -275,8 +276,26 @@ test('hook mode post-execute prefixes the executed-as note when the command was 
   assert.ok(out.content, 'post-execute returns accepted content')
   const texts = out.content.filter((b) => b.type === 'text').map((b) => b.text)
   assert.ok(texts.some((text) => text.includes('[rtk-optimizer] hook: executed as "rtk ls -la"')),
-    'note must be attached')
+    'note must be attached in debug mode')
   assert.ok(texts[0].includes('[rtk-optimizer]'), 'note must be the first text block')
+})
+
+test('hook mode post-execute attaches no note by default (invisible hook)', async () => {
+  const t = mount({
+    spawnResult: (spec) => {
+      if (spec.argv[1] === 'hook') {
+        return { outcome: { exitCode: 0, signal: null }, stdout: JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'rtk ls -la' } } }) }
+      }
+      return { outcome: { exitCode: 0, signal: null }, stdout: 'file1\n', stderr: '' }
+    }
+  })
+  await t.runCommand('set mode hook')
+  await pre(t, 'call-note-0', 'ls -la')
+  await exec(t, 'call-note-0', 'ls -la')
+  const result = { isError: false, content: [{ type: 'text', text: 'file1\n' }] }
+  const { out, nextCalled } = await post(t, 'call-note-0', result)
+  assert.equal(nextCalled, true, 'no note in default mode → fall through unchanged (compaction had nothing to do)')
+  assert.equal(out.kind, 'next')
 })
 
 test('hook mode post-execute attaches no note when the command was not replaced', async () => {
@@ -327,8 +346,9 @@ test('hook mode bounded maps: hookExecuted evicts oldest beyond 64 so its post-e
     }
   })
   await t.runCommand('set mode hook')
+  await t.runCommand('set debug true')
   // Fully execute 65 distinct commands so hookExecuted grows to 65 and evicts
-  // the oldest call-cap-0 entry.
+  // the oldest call-e-0 entry.
   for (let i = 0; i < 65; i++) {
     await pre(t, `call-e-${i}`, `echo ${i}`)
     await exec(t, `call-e-${i}`, `echo ${i}`)
@@ -339,6 +359,13 @@ test('hook mode bounded maps: hookExecuted evicts oldest beyond 64 so its post-e
   const { out, nextCalled } = await post(t, 'call-e-0', result)
   assert.equal(nextCalled, true, 'evicted executed-entry must drop the hook note')
   assert.equal(out.kind, 'next')
+  // The newest entry (call-e-64) is within the cap → its note must still attach
+  // in debug mode, proving eviction targets the oldest, not everything.
+  const { out: outNewest, nextCalled: ncNewest } = await post(t, 'call-e-64', result)
+  assert.equal(ncNewest, false, 'newest executed-entry must keep its note in debug mode')
+  const texts = outNewest.content.filter((b) => b.type === 'text').map((b) => b.text)
+  assert.ok(texts.some((text) => text.includes('[rtk-optimizer] hook: executed as "rtk rewrite"')),
+    'newest note must attach in debug mode')
 })
 
 test('hook mode post-execute clears a planned-but-not-executed hookPlan entry', async () => {

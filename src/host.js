@@ -594,13 +594,14 @@ return {
         }
       }
 
-      // hook mode: prefix a note that the command was replaced by its rtk form
+      // hook mode: the command was replaced by its rtk form — invisible by
+      // default (true "hook"), with a debug-gated note for diagnostics.
       // Also clean any hookPlan entry so a planned-but-never-executed call
       // (deny / scheduling error) leaks no bookkeeping.
       state.hookPlan.delete(exec.callId)
       const hookExecuted = state.hookExecuted.get(exec.callId)
       state.hookExecuted.delete(exec.callId)
-      if (hookExecuted !== undefined && !result.isError) {
+      if (config.debug && hookExecuted !== undefined && !result.isError) {
         const note = `[rtk-optimizer] hook: executed as "${hookExecuted}"`
         const blocks = result.content
         const existing = blocks.some((b) => b && b.type === 'text' && typeof b.text === 'string' && b.text.includes('[rtk-optimizer]'))
@@ -651,7 +652,11 @@ return {
                   c.outputCompaction.readCompaction = value === 'true'
                   return { kind: 'success', text: `rtk-optimizer readCompaction=${c.outputCompaction.readCompaction}.` }
                 }
-                return { kind: 'error', text: 'usage: /rtk set <key> <value> — keys: mode (suggest|rewrite|hook), enabled (true|false), guardWhenRtkMissing (true|false), readCompaction (true|false)' }
+                if (key === 'debug' && (value === 'true' || value === 'false')) {
+                  c.debug = value === 'true'
+                  return { kind: 'success', text: `rtk-optimizer debug=${c.debug}.` }
+                }
+                return { kind: 'error', text: 'usage: /rtk set <key> <value> — keys: mode (suggest|rewrite|hook), enabled (true|false), guardWhenRtkMissing (true|false), readCompaction (true|false), debug (true|false)' }
               }
               case 'show': {
                 // Probe (fresh) so the status is truthful even before the first

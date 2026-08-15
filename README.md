@@ -16,7 +16,8 @@ RTK 命令改写建议 + 工具输出压缩——DSH 插件（Host 拦截器）�
 - **`mode: suggest`（默认）**——不打断调用，在结果末尾附注 `[rtk-optimizer] rtk suggests: ...`。
 - **`mode: hook`（需 `/rtk set mode hook` 切换）**——插件在 `tools/pre-execute` 调 `rtk hook claude`
   获取改写，并在 `tools/execute` 短路，让命令真正以 `rtk <cmd>` 形式执行（输出经 rtk 过滤，
-  `rtk gain` 的 `Total commands` 会计数 +1），结果前标注 `[rtk-optimizer] hook: executed as "..."`。
+  `rtk gain` 的 `Total commands` 会计数 +1）。**默认无感**：模型看到的就是 rtk 过滤后的输出，
+  不附加任何标注；`/rtk set debug true` 时会在结果前标注 `[rtk-optimizer] hook: executed as "..."`（排查用）。
   ⚠️ **安全**：此模式绕过 DSH 的 bash sandbox（原命令由 rtk 包装器直接执行），请仅在可信环境开启。
 
 > DSH 工具参数在分发管道中不可变（`tools/execute` 只能改 `exec.signal`），因此 `rewrite`/`suggest` 模式无法自动改写命令（deny+反馈是架构允许下最接近自动改写的语义）；`hook` 模式例外——它通过 `tools/execute` 短路替换执行，命令真正以 `rtk <cmd>` 形式运行（见上）。
@@ -46,7 +47,7 @@ RTK 命令改写建议 + 工具输出压缩——DSH 插件（Host 拦截器）�
 | `show` | 当前配置 + rtk 二进制状态 + 统计 |
 | `verify` | 检查 rtk 二进制是否可用（探测结果缓存 60s） |
 | `stats` / `clear-stats` | 查看 / 重置压缩节省量统计 |
-| `set <key> <value>` | 运行时切换：`mode`（suggest\|rewrite\|hook）、`enabled`、`guardWhenRtkMissing`、`readCompaction` |
+| `set <key> <value>` | 运行时切换：`mode`（suggest\|rewrite\|hook）、`enabled`、`guardWhenRtkMissing`、`readCompaction`、`debug` |
 | `reset` | 恢复默认配置 |
 
 > 实现适配：rtk 0.43 对成功改写返回**退出码 3**（非文档所述 0），插件同时接受 0 与 3；不支持的命令退出 1 且无输出，命令原样放行。
