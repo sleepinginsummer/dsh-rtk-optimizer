@@ -25,7 +25,7 @@
 //PURE-CORE-START
 const DEFAULT_CONFIG = {
   enabled: true,
-  mode: 'suggest', // 'rewrite' | 'suggest'
+  mode: 'suggest', // 'suggest' | 'rewrite' | 'hook'
   guardWhenRtkMissing: true,
   rewriteTimeoutMs: 2000,
   suggestNoteMaxCommands: 1,
@@ -276,8 +276,19 @@ const rtkCore = {
 // ============================================================================
 const COMPACT_TOOL_NAMES = new Set(['bash', 'grep', 'read'])
 const RTK_MISSING_TTL_MS = 60000
+// Upper bound on per-call bookkeeping maps (suggestions, hookPlan,
+// hookExecuted) so a call that plans but never resolves cannot leak memory.
+const HOOK_PLAN_MAX = 64
 function errText(e) {
   return e && typeof e === 'object' && typeof e.message === 'string' ? e.message : String(e)
+}
+// Cap a Map at HOOK_PLAN_MAX by evicting the insertion-ordering oldest entry.
+function capMap(map) {
+  while (map.size > HOOK_PLAN_MAX) {
+    const oldest = map.keys().next().value
+    if (oldest === undefined) break
+    map.delete(oldest)
+  }
 }
 
 return {
@@ -297,7 +308,9 @@ return {
       rtkCheckedAt: 0,
       stats: { calls: 0, compacted: 0, savedChars: 0, byTool: {} },
       suggestions: new Map(), // callId → rewritten command (suggest mode)
-      denyGuard: new Map() // command → last deny ts (anti-loop)
+      denyGuard: new Map(), // command → last deny ts (anti-loop)
+      hookPlan: new Map(), // callId → rewritten command (hook mode)
+      hookExecuted: new Map() // callId → rewritten command actually executed (for post-execute note)
     }
 
     function sessionCwd(exec) {
@@ -313,10 +326,12 @@ return {
     }
 
     // ── rtk binary access ──
-    async function resolveRtk(signal) {
+    // `force` bypasses the missing-binary cache so an explicit user command
+    // (/rtk verify, /rtk show) always gets an authoritative, fresh answer.
+    async function resolveRtk(signal, force = false) {
       if (subprocess === undefined) return undefined
       const stale = state.rtkCheckedAt === 0 || now() - state.rtkCheckedAt > RTK_MISSING_TTL_MS
-      if (state.rtkResolved !== undefined && !stale) return state.rtkResolved
+      if (!force && state.rtkResolved !== undefined && !stale) return state.rtkResolved
       try {
         const exe = await subprocess.resolveExecutable('rtk', undefined, signal)
         state.rtkResolved = exe
@@ -368,6 +383,63 @@ return {
       }
     }
 
+    // ── rtk hook-mode rewrite: consult the rtk agent-hook engine (`rtk hook claude`)
+    // Reads a Claude Code PreToolUse event from stdin and returns the rewritten
+    // command from `updatedInput.command`, or undefined when rtk suggests no change.
+    async function rtkHookRewrite(exe, cwd, command, signal) {
+      const payload = JSON.stringify({
+        session_id: 'dsh-rtk-optimizer',
+        cwd,
+        hook_event_name: 'PreToolUse',
+        tool_name: 'Bash',
+        tool_input: { command }
+      })
+      try {
+        const handle = subprocess.spawn({
+          argv: [exe, 'hook', 'claude'],
+          cwd,
+          stdio: {
+            stdin: { data: payload },
+            stdout: { maxBytes: 8192 },
+            stderr: { maxBytes: 4096 }
+          },
+          graceMs: 300,
+          signal
+        })
+        let outcome
+        if (timer !== undefined && config.rewriteTimeoutMs > 0) {
+          outcome = await Promise.race([
+            handle.done,
+            timer.timeout(config.rewriteTimeoutMs).then(() => { handle.terminate(); return undefined })
+          ])
+        } else {
+          outcome = await handle.done
+        }
+        if (!outcome || outcome.exitCode !== 0) {
+          if (config.debug) console.error(`dsh-rtk-optimizer: rtk hook exit=${outcome ? outcome.exitCode : 'timeout'}`)
+          return undefined
+        }
+        const reader = handle.collected && handle.collected.stdout
+        const text = reader ? (await reader.readFrom(0)).text : ''
+        if (!text) return undefined
+        let parsed
+        try {
+          parsed = JSON.parse(text)
+        } catch (e) {
+          if (config.debug) console.error(`dsh-rtk-optimizer: rtk hook output not JSON: ${errText(e)}`)
+          return undefined
+        }
+        const rewritten = parsed && parsed.hookSpecificOutput && parsed.hookSpecificOutput.updatedInput
+          ? parsed.hookSpecificOutput.updatedInput.command
+          : undefined
+        if (config.debug) console.error(`dsh-rtk-optimizer: rtk hook of "${command}" → "${rewritten}"`)
+        return typeof rewritten === 'string' && rewritten.length > 0 && rewritten !== command ? rewritten : undefined
+      } catch (e) {
+        if (config.debug) console.error(`dsh-rtk-optimizer: rtk hook threw: ${errText(e)}`)
+        return undefined
+      }
+    }
+
     // ── tools/pre-execute: rtk rewrite suggestion / deny ──
     ctx.on('tools/pre-execute', async (exec, next) => {
       if (!config.enabled || exec.name !== 'bash') return next()
@@ -388,7 +460,9 @@ return {
         }
         return next()
       }
-      const rewritten = await rtkRewrite(exe, cwd, command, exec.signal)
+      const rewritten = config.mode === 'hook'
+        ? await rtkHookRewrite(exe, cwd, command, exec.signal)
+        : await rtkRewrite(exe, cwd, command, exec.signal)
       if (rewritten === undefined) {
         if (config.debug && !state.rewriteFailureNoted) {
           state.rewriteFailureNoted = true
@@ -407,6 +481,11 @@ return {
           reason: `[rtk-optimizer] Run this rtk-rewritten command instead (${rewritten.length} chars, was ${command.length}):\n${rewritten}`
         }
       }
+      if (config.mode === 'hook') {
+        state.hookPlan.set(exec.callId, rewritten)
+        capMap(state.hookPlan)
+        return next()
+      }
       // suggest mode: remember for post-execute enrichment
       state.suggestions.set(exec.callId, rewritten)
       if (state.suggestions.size > 64) {
@@ -414,6 +493,70 @@ return {
         state.suggestions.delete(oldest)
       }
       return next()
+    })
+
+    // ── tools/execute: hook mode replaces execution with `rtk <cmd>` ──
+    ctx.on('tools/execute', async (exec, next) => {
+      if (!config.enabled || config.mode !== 'hook' || exec.name !== 'bash') return next()
+      const rewritten = state.hookPlan.get(exec.callId)
+      if (rewritten === undefined) return next()
+      state.hookPlan.delete(exec.callId)
+      const cwd = sessionCwd(exec)
+      if (cwd === undefined) return next()
+      const timeoutMs = exec.arguments && Number.isFinite(exec.arguments.timeoutMs) && exec.arguments.timeoutMs > 0
+        ? exec.arguments.timeoutMs
+        : 120000
+      try {
+        const handle = subprocess.spawn({
+          argv: ['/bin/bash', '-c', rewritten],
+          cwd,
+          stdio: {
+            stdin: 'ignore',
+            stdout: { maxBytes: 1000000, spill: { maxBytes: 10000000 } },
+            stderr: { maxBytes: 100000, spill: { maxBytes: 1000000 } }
+          },
+          graceMs: 300,
+          signal: exec.signal
+        })
+        let outcome
+        if (timer !== undefined) {
+          outcome = await Promise.race([
+            handle.done,
+            timer.timeout(timeoutMs).then(() => { handle.terminate(); return undefined })
+          ])
+        } else {
+          outcome = await handle.done
+        }
+        const readStream = async (reader) => {
+          if (!reader) return { text: '', truncated: false }
+          const read = await reader.readFrom(0)
+          return {
+            text: read.text,
+            truncated: read.lossy === true,
+            ...(read.spillPath !== undefined ? { spillPath: read.spillPath } : {})
+          }
+        }
+        const stdout = await readStream(handle.collected && handle.collected.stdout)
+        const stderr = await readStream(handle.collected && handle.collected.stderr)
+        const timedOut = outcome === undefined
+        state.hookExecuted.set(exec.callId, rewritten)
+        capMap(state.hookExecuted)
+        return {
+          value: {
+            kind: 'foreground',
+            exitCode: timedOut ? null : outcome.exitCode,
+            signal: timedOut ? 'SIGTERM' : outcome.signal,
+            timedOut,
+            aborted: exec.signal && exec.signal.aborted === true,
+            timeoutMs,
+            stdout,
+            stderr
+          }
+        }
+      } catch (e) {
+        if (config.debug) console.error(`dsh-rtk-optimizer: hook execute threw: ${errText(e)}`)
+        return next()
+      }
     })
 
     // ── tools/post-execute: output compaction + suggestion note ──
@@ -451,6 +594,22 @@ return {
         }
       }
 
+      // hook mode: the command was replaced by its rtk form — invisible by
+      // default (true "hook"), with a debug-gated note for diagnostics.
+      // Also clean any hookPlan entry so a planned-but-never-executed call
+      // (deny / scheduling error) leaks no bookkeeping.
+      state.hookPlan.delete(exec.callId)
+      const hookExecuted = state.hookExecuted.get(exec.callId)
+      state.hookExecuted.delete(exec.callId)
+      if (config.debug && hookExecuted !== undefined && !result.isError) {
+        const note = `[rtk-optimizer] hook: executed as "${hookExecuted}"`
+        const blocks = result.content
+        const existing = blocks.some((b) => b && b.type === 'text' && typeof b.text === 'string' && b.text.includes('[rtk-optimizer]'))
+        if (!existing) {
+          compactedBlocks = [{ type: 'text', text: note }, ...(compactedBlocks ?? blocks)]
+        }
+      }
+
       if (compactedBlocks === undefined) return next()
 
       state.stats.calls += 1
@@ -468,7 +627,7 @@ return {
         name: 'rtk',
         description: 'RTK optimizer status: show config, verify the rtk binary, or show compaction stats.',
         input: { hint: 'show | verify | stats | clear-stats | reset | help' },
-        handler: (invocation) => {
+        handler: async (invocation) => {
           const line = invocation.rawInput.trim()
           try {
             const c = cfg()
@@ -477,7 +636,7 @@ return {
               case 'set': {
                 const key = rest[0]
                 const value = rest[1]
-                if (key === 'mode' && (value === 'suggest' || value === 'rewrite')) {
+                if (key === 'mode' && (value === 'suggest' || value === 'rewrite' || value === 'hook')) {
                   c.mode = value
                   return { kind: 'success', text: `rtk-optimizer mode set to ${value}.` }
                 }
@@ -493,12 +652,17 @@ return {
                   c.outputCompaction.readCompaction = value === 'true'
                   return { kind: 'success', text: `rtk-optimizer readCompaction=${c.outputCompaction.readCompaction}.` }
                 }
-                return { kind: 'error', text: 'usage: /rtk set <key> <value> — keys: mode (suggest|rewrite), enabled (true|false), guardWhenRtkMissing (true|false), readCompaction (true|false)' }
+                if (key === 'debug' && (value === 'true' || value === 'false')) {
+                  c.debug = value === 'true'
+                  return { kind: 'success', text: `rtk-optimizer debug=${c.debug}.` }
+                }
+                return { kind: 'error', text: 'usage: /rtk set <key> <value> — keys: mode (suggest|rewrite|hook), enabled (true|false), guardWhenRtkMissing (true|false), readCompaction (true|false), debug (true|false)' }
               }
               case 'show': {
-                const rtkState = state.rtkResolved === undefined ? 'unknown (not probed yet)'
-                  : state.rtkResolved === null ? 'missing'
-                    : state.rtkResolved
+                // Probe (fresh) so the status is truthful even before the first
+                // bash call — previously it stayed "not probed yet" forever.
+                const exe = await resolveRtk(undefined, true)
+                const rtkState = exe === undefined ? 'missing' : exe
                 return {
                   kind: 'success',
                   text: [
@@ -513,9 +677,10 @@ return {
                 }
               }
               case 'verify': {
-                const exe = state.rtkResolved
-                if (exe === undefined) return { kind: 'success', text: 'rtk binary: not probed yet (runs on the next bash call, or install rtk and run /rtk verify again)' }
-                if (exe === null) return { kind: 'success', text: 'rtk binary: NOT FOUND on PATH (rewrites disabled, original commands run unchanged)' }
+                // The point of "verify" is to check the binary NOW: force a
+                // fresh probe instead of reporting the stale cached state.
+                const exe = await resolveRtk(undefined, true)
+                if (exe === undefined) return { kind: 'success', text: 'rtk binary: NOT FOUND on PATH (rewrites disabled, original commands run unchanged)' }
                 return { kind: 'success', text: `rtk binary: ${exe}` }
               }
               case 'stats': {
@@ -547,7 +712,7 @@ return {
               case '': {
                 return {
                   kind: 'success',
-                  text: 'rtk-optimizer: /rtk [show|verify|stats|clear-stats|reset|set|help]\n  show        current configuration and runtime status\n  verify      check whether the rtk binary is available\n  stats       compaction savings for this process\n  clear-stats reset the counters\n  set         /rtk set <key> <value> (mode|enabled|guardWhenRtkMissing|readCompaction)\n  reset       restore default configuration'
+                  text: 'rtk-optimizer: /rtk [show|verify|stats|clear-stats|reset|set|help]\n  show        current configuration and runtime status\n  verify      check whether the rtk binary is available\n  stats       compaction savings for this process\n  clear-stats reset the counters\n  set         /rtk set <key> <value> (mode(suggest|rewrite|hook)|enabled|guardWhenRtkMissing|readCompaction)\n  reset       restore default configuration'
                 }
               }
               default:
